@@ -878,7 +878,14 @@ impl Layout {
         configure_variable_in_area_constraints(&mut solver, &variables, area_size)?;
         configure_variable_constraints(&mut solver, &variables)?;
         configure_flex_constraints(&mut solver, area_size, &spacers, flex, spacing)?;
-        configure_constraints(&mut solver, area_size, &segments, constraints, flex)?;
+        configure_constraints(
+            &mut solver,
+            area_size,
+            &segments,
+            constraints,
+            flex,
+            spacing,
+        )?;
         configure_fill_constraints(&mut solver, &segments, constraints, flex)?;
 
         if !flex.is_legacy() {
@@ -949,7 +956,14 @@ fn configure_constraints(
     segments: &[Element],
     constraints: &[Constraint],
     flex: Flex,
+    spacing: i16,
 ) -> Result<(), AddConstraintError> {
+    // When using Spacing::Overlap, the virtual total area is larger than the physical area
+    // because overlapping segments share space. Adjust the size used for Ratio and Percentage
+    // constraints so each segment gets its fair share of the virtual total.
+    let spacing_adjustment = f64::from(spacing)
+        * f64::from((segments.len().max(1) - 1) as i16)
+        * FLOAT_PRECISION_MULTIPLIER;
     for (&constraint, &segment) in constraints.iter().zip(segments.iter()) {
         match constraint {
             Constraint::Max(max) => {
@@ -968,12 +982,13 @@ fn configure_constraints(
                 solver.add_constraint(segment.has_int_size(length, LENGTH_SIZE_EQ))?;
             }
             Constraint::Percentage(p) => {
-                let size = area.size() * f64::from(p) / 100.00;
+                let size = (area.size() - spacing_adjustment) * f64::from(p) / 100.00;
                 solver.add_constraint(segment.has_size(size, PERCENTAGE_SIZE_EQ))?;
             }
             Constraint::Ratio(num, den) => {
                 // avoid division by zero by using 1 when denominator is 0
-                let size = area.size() * f64::from(num) / f64::from(den.max(1));
+                let size =
+                    (area.size() - spacing_adjustment) * f64::from(num) / f64::from(den.max(1));
                 solver.add_constraint(segment.has_size(size, RATIO_SIZE_EQ))?;
             }
             Constraint::Fill(_) => {
@@ -2922,5 +2937,70 @@ mod tests {
                 .collect::<Vec<(u16, u16)>>();
             assert_eq!(result, expected);
         }
+    }
+
+    #[test]
+    fn spacing_overlap_with_ratio() {
+        // Two equal Ratio segments in 11 cols with 1-col overlap.
+        // Virtual total = 11 + 1 = 12, each segment gets 12/2 = 6.
+        let area = Rect::new(0, 0, 11, 3);
+        let [a1, a2] = Layout::horizontal([Constraint::Ratio(1, 2); 2])
+            .spacing(Spacing::Overlap(1))
+            .areas(area);
+        assert_eq!(a1.width, 6);
+        assert_eq!(a2.width, 6);
+        assert_eq!(a2.x, 5);
+    }
+
+    #[test]
+    fn spacing_overlap_with_percentage() {
+        let area = Rect::new(0, 0, 11, 3);
+        let [a1, a2] = Layout::horizontal([Constraint::Percentage(50); 2])
+            .spacing(Spacing::Overlap(1))
+            .areas(area);
+        assert_eq!(a1.width, 6);
+        assert_eq!(a2.width, 6);
+        assert_eq!(a2.x, 5);
+    }
+
+    #[test]
+    fn spacing_overlap_single_constraint_ratio() {
+        // A single segment should be unaffected by overlap (no gap to share).
+        let area = Rect::new(0, 0, 20, 1);
+        let [a1] = Layout::horizontal([Constraint::Ratio(1, 1)])
+            .spacing(Spacing::Overlap(5))
+            .areas(area);
+        assert_eq!(a1.width, 20);
+        assert_eq!(a1.x, 0);
+    }
+
+    #[test]
+    fn spacing_overlap_three_ratio_segments() {
+        // Three equal Ratio segments in 16 cols with 2-col overlap.
+        // Virtual total = 16 + 2*2 = 20, each gets 20/3 ~= 6-7.
+        let area = Rect::new(0, 0, 16, 1);
+        let [a1, a2, a3] = Layout::horizontal([Constraint::Ratio(1, 3); 3])
+            .spacing(Spacing::Overlap(2))
+            .areas(area);
+        // All segments should cover the full area with overlaps
+        assert!(a1.width >= 6);
+        assert!(a2.width >= 6);
+        assert!(a3.width >= 6);
+        assert_eq!(a1.x, 0);
+        // Each subsequent segment starts `overlap` columns before the previous ends
+        assert_eq!(a2.x, a1.right() - 2);
+        assert_eq!(a3.x, a2.right() - 2);
+    }
+
+    #[test]
+    fn spacing_overlap_with_vertical_ratio() {
+        // Vertical layout should work the same way
+        let area = Rect::new(0, 0, 10, 11);
+        let [a1, a2] = Layout::vertical([Constraint::Ratio(1, 2); 2])
+            .spacing(Spacing::Overlap(1))
+            .areas(area);
+        assert_eq!(a1.height, 6);
+        assert_eq!(a2.height, 6);
+        assert_eq!(a2.y, 5);
     }
 }
